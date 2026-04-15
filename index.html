@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+  <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
@@ -373,7 +373,7 @@
       font-weight: 600; letter-spacing: .04em;
       margin-top: 14px;
     }
-    .status.scanning { background: rgba(0,212,255,.1); color: var(--accent); }
+    .status.scanning { background: rgba(240,165,0,.1); color: var(--accent); }
     .status.success  { background: rgba(0,255,170,.1); color: var(--success); }
     .status.error    { background: rgba(255,68,102,.1); color: var(--danger); }
     .status-dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
@@ -631,7 +631,7 @@
 
 <!-- ═══════════════════ LIBRARIES ═══════════════════ -->
 <!-- ZXing for scanning/reading -->
-<script src="https://unpkg.com/@zxing/library@0.19.1/umd/index.min.js"></script>
+<script src="https://unpkg.com/@zxing/library@0.18.6/umd/index.min.js"></script>
 <!-- qrcode.js for generation -->
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 
@@ -650,22 +650,21 @@ function switchTab(name) {
 
 /* ════════════════════════════════════════════
    CAMERA SCANNER
+   Uses getUserMedia directly + ZXing decode loop
+   (avoids the broken listVideoInputDevices API)
 ═══════════════════════════════════════════ */
-let codeReader = null;
 let scanActive = false;
+let scanRafId  = null;
 
 async function startCamera() {
   setStatus('scanner', 'scanning', 'Initializing camera…');
   try {
-    codeReader = new ZXing.BrowserQRCodeReader();
-    const devices = await ZXing.BrowserCodeReader.listVideoInputDevices();
-    const deviceId = devices.length > 1 ? devices[1].deviceId : (devices[0]?.deviceId);
-
-    await codeReader.decodeFromVideoDevice(deviceId, 'camera-feed', (result, err) => {
-      if (result) {
-        handleScanResult(result.getText());
-      }
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } }
     });
+    const video = document.getElementById('camera-feed');
+    video.srcObject = stream;
+    await video.play();
 
     scanActive = true;
     document.getElementById('scan-idle').style.display = 'none';
@@ -673,14 +672,36 @@ async function startCamera() {
     document.getElementById('btn-start-cam').style.display = 'none';
     document.getElementById('btn-stop-cam').style.display = 'inline-flex';
     setStatus('scanner', 'scanning', 'Scanning — point camera at a QR code');
+
+    tickScan();
   } catch (e) {
     setStatus('scanner', 'error', 'Camera error: ' + (e.message || e));
   }
 }
 
+function tickScan() {
+  if (!scanActive) return;
+  const video  = document.getElementById('camera-feed');
+  const canvas = document.getElementById('canvas-hidden');
+  if (video.readyState === video.HAVE_ENOUGH_DATA) {
+    canvas.width  = video.videoWidth;
+    canvas.height = video.videoHeight;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(video, 0, 0);
+    const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    try {
+      const luminance    = new ZXing.HTMLCanvasElementLuminanceSource(canvas);
+      const binaryBitmap = new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(luminance));
+      const result       = new ZXing.QRCodeReader().decode(binaryBitmap);
+      if (result) { handleScanResult(result.getText()); return; }
+    } catch(e) { /* not found yet, keep scanning */ }
+  }
+  scanRafId = requestAnimationFrame(tickScan);
+}
+
 function stopCamera() {
-  if (codeReader) { try { codeReader.reset(); } catch(e){} codeReader = null; }
   scanActive = false;
+  if (scanRafId) { cancelAnimationFrame(scanRafId); scanRafId = null; }
   const v = document.getElementById('camera-feed');
   if (v.srcObject) { v.srcObject.getTracks().forEach(t => t.stop()); v.srcObject = null; }
   document.getElementById('scan-idle').style.display = 'flex';
@@ -698,6 +719,8 @@ function handleScanResult(text) {
 
 /* ════════════════════════════════════════════
    FILE READER
+   Draw image onto canvas first, then decode
+   from pixel data — avoids CORS/blob issues
 ═══════════════════════════════════════════ */
 const dropZone = document.getElementById('drop-zone');
 dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
@@ -711,29 +734,50 @@ dropZone.addEventListener('drop', e => {
 function handleFile(e) {
   const file = e.target.files[0];
   if (file) processImageFile(file);
+  // reset so the same file can be re-selected
+  e.target.value = '';
 }
 
 function processImageFile(file) {
   const url = URL.createObjectURL(file);
-  const img = document.getElementById('reader-img');
-  img.src = url;
+  const previewImg = document.getElementById('reader-img');
+  previewImg.src = url;
   document.getElementById('reader-preview').classList.add('visible');
   document.getElementById('reader-result').classList.remove('visible');
   setStatus('reader', 'scanning', 'Decoding…');
 
-  const image = new Image();
-  image.onload = async () => {
-    try {
-      const reader = new ZXing.BrowserQRCodeReader();
-      const result = await reader.decodeFromImageUrl(url);
-      showResult('reader', result.getText());
-      setStatus('reader', 'success', 'QR code decoded successfully');
-    } catch (e) {
-      setStatus('reader', 'error', 'No QR code found in this image');
+  const img = new Image();
+  img.onload = () => {
+    // Draw onto an offscreen canvas, decode from that
+    const c = document.createElement('canvas');
+    // Try up to 3 scales for better detection on small/large images
+    const scales = [1, 2, 0.5];
+    let decoded = false;
+    for (const scale of scales) {
+      c.width  = img.naturalWidth  * scale;
+      c.height = img.naturalHeight * scale;
+      const ctx = c.getContext('2d');
+      ctx.drawImage(img, 0, 0, c.width, c.height);
+      try {
+        const luminance = new ZXing.HTMLCanvasElementLuminanceSource(c);
+        const bitmap    = new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(luminance));
+        const result    = new ZXing.QRCodeReader().decode(bitmap);
+        if (result) {
+          showResult('reader', result.getText());
+          setStatus('reader', 'success', 'QR code decoded!');
+          decoded = true;
+          break;
+        }
+      } catch(e) { /* try next scale */ }
+    }
+    if (!decoded) {
+      setStatus('reader', 'error', 'No QR code found — try a clearer image');
       document.getElementById('reader-result').classList.remove('visible');
     }
+    URL.revokeObjectURL(url);
   };
-  image.src = url;
+  img.onerror = () => setStatus('reader', 'error', 'Could not load image');
+  img.src = url;
 }
 
 /* ════════════════════════════════════════════
